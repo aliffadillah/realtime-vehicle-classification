@@ -1,4 +1,3 @@
-<!-- detection/templates/detection/index.html -->
 <!DOCTYPE html>
 <html lang="en">
   <head>
@@ -11,9 +10,28 @@
       crossorigin="anonymous"
     />
     <title>Vehicle Detection</title>
+    <style>
+      /* Make the video stream fit the screen without being cropped */
+      html, body {
+        margin: 0;
+        padding: 0;
+        height: 100%;
+        overflow: hidden;
+      }
+
+      img {
+        width: 100%;
+        height: 100%;
+        object-fit: contain;
+        display: block;
+      }
+    </style>
   </head>
   <body>
-    <img src="{% url 'video_feed' %}" class="object-fit-cover border rounded" />
+    <img
+      src="{% url 'video_feed' %}"
+      alt="Video Stream"
+    />
     <script
       src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"
       integrity="sha384-YvpcrYf0tY3lHB60NNkmXc5s9fDVZLESaAA55NDzOxhy9GkcIdslK1eN7N6jIeHz"

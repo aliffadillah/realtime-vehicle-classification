@@ -5,6 +5,7 @@ from ultralytics import YOLO
 import cpuinfo
 from concurrent.futures import ThreadPoolExecutor
 import os
+import time  # Tambahkan ini untuk menghitung waktu
 
 # Pengaturan lingkungan untuk menghindari konflik dengan pustaka
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
@@ -18,7 +19,7 @@ model_path = 'detection/models/yolov8n_openvino_model/'
 model = YOLO(model_path)
 
 # Konfigurasi model dan deteksi
-conf_threshold = 0.3
+conf_threshold = 0.1
 target_class_ids = {0, 2, 3, 5, 7}  # IDs untuk kendaraan
 box_width, box_height = 1080, 720
 line_y = 360  # Posisi garis di tengah
@@ -92,34 +93,82 @@ def process_frame(frame, results):
 
 def gen_frames():
     cap = cv.VideoCapture(rtsp_url)
-    fps = cap.get(cv.CAP_PROP_FPS)  # Ambil FPS dari sumber video
+    
+    # Set resolusi input untuk mengurangi beban pemrosesan
+    cap.set(cv.CAP_PROP_FRAME_WIDTH, 640)
+    cap.set(cv.CAP_PROP_FRAME_HEIGHT, 480)
+
     cpu_type = cpu_info()
 
-    with ThreadPoolExecutor(max_workers=1) as executor:
-        while cap.isOpened():
+    # Konfigurasi untuk ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        frame_skip_interval = 2  # Hanya memproses setiap frame ke-2
+        frame_counter = 0
+        retry_count = 0
+        max_retries = 5  # Maksimal 5 kali percobaan ulang jika terjadi kesalahan
+
+        while retry_count < max_retries:  # Coba ulang jika ada kegagalan
+            if not cap.isOpened():
+                print("Reconnecting to RTSP stream...")
+                cap = cv.VideoCapture(rtsp_url)
+                retry_count += 1
+                time.sleep(2)  # Beri waktu sebelum mencoba kembali
+                continue
+
+            start_time = time.time()  # Waktu mulai pemrosesan frame
+
             ret, frame = cap.read()
             if not ret:
-                break
+                print("Failed to read frame, reconnecting...")
+                retry_count += 1
+                cap.release()
+                cap = cv.VideoCapture(rtsp_url)
+                time.sleep(2)  # Beri waktu sebelum mencoba kembali
+                continue
 
-            frame = cv.resize(frame, (1920, 1080))
+            frame_counter += 1
+            if frame_counter % frame_skip_interval != 0:
+                continue  # Lewati frame untuk mengurangi beban pemrosesan
 
-            # Lakukan inferensi secara asinkron
-            future = executor.submit(model, frame, stream=True, device="cpu")  # Gunakan CPU
-            results = future.result()
+            try:
+                # Lakukan inferensi secara asinkron
+                future = executor.submit(model, frame, stream=True, device="cpu")
+                results = future.result()
 
-            # Proses frame
-            frame = process_frame(frame, results)
+                # Proses frame
+                frame = process_frame(frame, results)
 
-            # Tampilkan FPS pada frame
-            display_fps(frame, fps, cpu_type)
+                # Hitung FPS berdasarkan waktu yang berlalu
+                elapsed_time = time.time() - start_time
+                fps = 1 / elapsed_time
 
-            ret, buffer = cv.imencode('.jpg', frame)
-            frame = buffer.tobytes()
+                # Pastikan FPS tidak melebihi 25
+                if fps > 25:
+                    time.sleep(1 / 25 - elapsed_time)
 
-            yield (b'--frame\r\n'
-                   b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
+                # Tampilkan FPS pada frame
+                display_fps(frame, fps, cpu_type)
+
+                # Encode frame ke format JPEG
+                ret, buffer = cv.imencode('.jpg', frame)
+                frame = buffer.tobytes()
+
+                yield (b'--frame\r\n'
+                       b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
+
+                # Reset retry counter setelah sukses memproses frame
+                retry_count = 0
+
+            except Exception as e:
+                print(f"Error occurred during processing: {e}")
+                retry_count += 1
+                cap.release()
+                cap = cv.VideoCapture(rtsp_url)
+                time.sleep(2)  # Beri waktu sebelum mencoba kembali
+                continue
 
     cap.release()
+
 
 def index(request):
     return render(request, 'detection/index.html')
