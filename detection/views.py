@@ -1,12 +1,11 @@
 from django.shortcuts import render
 from django.http import StreamingHttpResponse
 import cv2 as cv
-from openvino.runtime import Core
+from ultralytics import YOLO
 import cpuinfo
 from concurrent.futures import ThreadPoolExecutor
 import os
 import time
-import numpy as np
 
 # Environmental settings
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
@@ -15,23 +14,19 @@ os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 # RTSP stream URL
 rtsp_url = 'rtsp://admin:Pac1nk0!@158.140.176.70:9292/Streaming/Channels/101'
 
-# Initialize OpenVINO runtime
-ie = Core()
-model_path = "detection\models\yolov8n_openvino_model\yolov8n.xml"
-compiled_model = ie.compile_model(model=model_path, device_name="CPU")
-input_layer = compiled_model.input(0)
-output_layer = compiled_model.output(0)
+# Load model
+model_path = 'detection/models/yolov8n_openvino_model/'
+model = YOLO(model_path)
 
 # Configuration
-conf_threshold = 0.3
-nms_threshold = 0.4
+conf_threshold = 0.1
 target_class_ids = {0, 2, 3, 5, 7}  # IDs for vehicles and people
-vehicle_names = {0: 'person', 2: 'car', 3: 'motorcycle', 5: 'bus', 7: 'truck'}
+vehicle_names = {0: 'motor', 2: 'car', 3: 'bus', 5: 'truck', 7: 'person'}
 box_width, box_height = 1080, 720
-line_y = 360  # Position of the line in the middle
+line_y = 540  # Position of the line in the middle
 
 # Initialize counters and trackers
-vehicle_counts = {'motor': 0, 'car': 0, 'bus': 0, 'truck': 0, 'total': 0}
+vehicle_counts = {'motor': 0, 'car': 0, 'bus': 0, 'truck': 0}
 person_count = 0
 vehicle_trackers = {}
 
@@ -100,13 +95,7 @@ def update_vehicle_tracker(vehicle_id, class_id, x1, y1, x2, y2):
     if vehicle_id not in vehicle_trackers[vehicle_name]:
         vehicle_trackers[vehicle_name][vehicle_id] = {'counted': False, 'bbox': (x1, y1, x2, y2)}
 
-def update_total_vehicle_count():
-    global vehicle_counts
-    vehicle_counts['total'] = sum(vehicle_counts[vehicle] for vehicle in vehicle_counts if vehicle != 'total')
-
 def process_frame(frame, results):
-    global vehicle_counts, person_count, vehicle_trackers
-    
     height, width = frame.shape[:2]
     x_center = width // 2
     y_center = height // 2
@@ -118,57 +107,37 @@ def process_frame(frame, results):
     cv.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
     cv.line(frame, (x1, y1 + line_y), (x2, y1 + line_y), (0, 0, 255), 2)
 
-    if len(results.shape) == 3:  # Assuming model output is in correct shape
-        boxes, confidences, class_ids = [], [], []
+    global vehicle_counts, person_count, vehicle_trackers
 
-        for detection in results[0]:  # Accessing first batch
-            if len(detection) < 7:
-                print(f"Skipping detection with unexpected format: {detection}")
-                continue
+    for result in results:
+        for box in result.boxes.data.tolist():
+            x1_box, y1_box, x2_box, y2_box, class_id, score = get_bbox_info(box)
+            vehicle_name = vehicle_names.get(class_id, 'unknown')
 
-            try:
-                xmin, ymin, xmax, ymax, label, score = detection[2], detection[3], detection[4], detection[5], detection[1], detection[0]
-                if score > conf_threshold:  # Only consider detections with confidence above threshold
-                    boxes.append([int(xmin * width), int(ymin * height), int(xmax * width), int(ymax * height)])
-                    confidences.append(float(score))
-                    class_ids.append(int(label))
-
-            except Exception as e:
-                print(f"Error processing detection: {detection}, Error: {e}")
-
-        # Optionally apply Non-Maximum Suppression (NMS) to reduce duplicate boxes
-        indices = cv.dnn.NMSBoxes(boxes, confidences, conf_threshold, nms_threshold)
-        if len(indices) > 0:
-            for i in indices.flatten():
-                x1_box, y1_box, x2_box, y2_box = boxes[i]
-                class_id = class_ids[i]
-                
-                if class_id in target_class_ids:  # Check if class is in the target classes
+            if class_id in target_class_ids and score >= conf_threshold:
+                if x1 <= x1_box <= x2 and y1 <= y1_box <= y2:
                     bbox_rectangle(x1_box, y1_box, x2_box, y2_box, frame)
                     bbox_class_id_label(x1_box, y1_box, x2_box, y2_box, frame, class_id)
                     x_centroid, y_centroid = bbox_centroid(x1_box, x2_box, y1_box, y2_box, frame)
 
-                    # Generate a unique vehicle ID based on bounding box and class
+                    # Generate a unique vehicle ID based on its bounding box coordinates
                     vehicle_id = hash((x1_box, y1_box, x2_box, y2_box, class_id))
+
+                    # Update tracker
                     update_vehicle_tracker(vehicle_id, class_id, x1_box, y1_box, x2_box, y2_box)
 
-                    if class_id == 7:  # Person class
-                        if not vehicle_trackers['person'].get(vehicle_id, {}).get('counted', False):
+                    if vehicle_name == 'person':
+                        if not vehicle_trackers[vehicle_name].get(vehicle_id, {}).get('counted', False):
                             person_count += 1
-                            vehicle_trackers['person'][vehicle_id]['counted'] = True
-                    else:  # Vehicle classes
-                        if not vehicle_trackers[vehicle_names[class_id]].get(vehicle_id, {}).get('counted', False):
-                            if y1_box < y1 + line_y and y_centroid > y1 + line_y:
-                                vehicle_counts[vehicle_names[class_id]] += 1
-                                vehicle_trackers[vehicle_names[class_id]][vehicle_id]['counted'] = True
-                                update_total_vehicle_count()
-                                print(f"{vehicle_names[class_id].capitalize()} passed the line Y")
+                            vehicle_trackers[vehicle_name][vehicle_id]['counted'] = True
+                    else:
+                        if not vehicle_trackers[vehicle_name].get(vehicle_id, {}).get('counted', False):
+                            if y1_box < y1 + line_y and y2_box > y1 + line_y:
+                                vehicle_counts[vehicle_name] += 1
+                                vehicle_trackers[vehicle_name][vehicle_id]['counted'] = True
+                                print(f"{vehicle_name.capitalize()} passed the line Y")
 
-    else:
-        print("Unexpected results format.")
-    
     return frame
-
 
 def gen_frames():
     cap = cv.VideoCapture(rtsp_url)
@@ -208,13 +177,8 @@ def gen_frames():
                 continue
 
             try:
-                # Preprocess the frame for OpenVINO
-                preprocessed_frame = cv.resize(frame, (input_layer.shape[2], input_layer.shape[3]))
-                preprocessed_frame = preprocessed_frame.transpose((2, 0, 1))  # Change data layout from HWC to CHW
-                preprocessed_frame = preprocessed_frame.reshape(1, 3, input_layer.shape[2], input_layer.shape[3])
-
-                # Inference
-                results = compiled_model([preprocessed_frame])[output_layer]
+                future = executor.submit(model, frame, stream=True, device="cpu")
+                results = future.result()
 
                 frame = process_frame(frame, results)
 
